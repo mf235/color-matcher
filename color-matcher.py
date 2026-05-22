@@ -40,7 +40,8 @@ class DropLabel(QLabel):
         self.setStyleSheet("border: 2px dashed #00ffff; background-color: #1a1a1a; color: #ffffff;")
         self.setAcceptDrops(True)
         self.image_path = None
-        self.cv_image = None
+        self.original_cv_image = None # ★ 高画質の元データを退避
+        self.cv_image = None          # ★ UIプレビュー用の縮小データ
         self.setMinimumSize(300, 300)
 
     def dragEnterEvent(self, event):
@@ -60,14 +61,18 @@ class DropLabel(QLabel):
         if img is not None:
             self.image_path = path
             
-            # 600x600に収まるようにリサイズ
+            # ★ オリジナルの高画質画像をそのままメモリに退避
+            self.original_cv_image = img.copy() 
+            
+            # ★ サムネイル表示用だけにリサイズを行う
             h, w = img.shape[:2]
             scale = min(600/w, 600/h)
             if scale < 1:
                 new_w, new_h = int(w * scale), int(h * scale)
-                img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+                self.cv_image = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+            else:
+                self.cv_image = img.copy()
             
-            self.cv_image = img
             self.update_display()
             self.parent().process_image()
 
@@ -88,16 +93,15 @@ class DropLabel(QLabel):
 class ColorMatcherApp(QWidget):
     def __init__(self):
         super().__init__()
-        self.result_image = None
+        self.result_image = None # ★ ここには常に高画質な処理結果が入る
         self.initUI()
 
     def initUI(self):
-        self.setWindowTitle('Color Matcher')
+        self.setWindowTitle('Grok Color Matcher - Ultimate Edition')
         self.setStyleSheet("background-color: #0d0d0d; color: #ffffff;")
         
         main_layout = QVBoxLayout()
 
-        # 上部：D&Dエリア
         drop_layout = QHBoxLayout()
         self.source_label = DropLabel("ここに元画像を\nドロップ\n(透過PNG対応)", self)
         self.target_label = DropLabel("ここに色参考画像を\nドロップ", self)
@@ -105,20 +109,17 @@ class ColorMatcherApp(QWidget):
         drop_layout.addWidget(self.target_label)
         main_layout.addLayout(drop_layout)
 
-        # 中部：プレビューエリア
         self.preview_label = QLabel("プレビュー", self)
         self.preview_label.setAlignment(Qt.AlignCenter)
         self.preview_label.setStyleSheet("border: 2px solid #a020f0; background-color: #1a1a1a;")
         self.preview_label.setMinimumSize(600, 600)
         main_layout.addWidget(self.preview_label)
 
-        # 下部：操作パネル
         control_layout = QHBoxLayout()
         
         algo_label = QLabel("モード:", self)
         control_layout.addWidget(algo_label)
         
-        # コンボボックスの追加
         self.algo_combo = QComboBox(self)
         self.algo_combo.setStyleSheet("background-color: #2a2a2a; color: #00ffff; border: 1px solid #a020f0; padding: 5px; font-weight: bold;")
         self.algo_combo.addItems([
@@ -127,7 +128,7 @@ class ColorMatcherApp(QWidget):
             "3. 主要色抽出 (K-Means)", 
             "4. ヒストグラムマッチング"
         ])
-        self.algo_combo.setCurrentIndex(1)
+        self.algo_combo.setCurrentIndex(1) # ★ デフォルトを「2. 白黒除外」に設定
         self.algo_combo.currentIndexChanged.connect(self.process_image)
         control_layout.addWidget(self.algo_combo)
 
@@ -152,15 +153,15 @@ class ColorMatcherApp(QWidget):
         self.setLayout(main_layout)
 
     def process_image(self):
-        if self.source_label.cv_image is None or self.target_label.cv_image is None:
+        # ★ 計算はすべて「退避してあるオリジナル画像」に対して行う
+        if self.source_label.original_cv_image is None or self.target_label.original_cv_image is None:
             return
 
-        source = self.source_label.cv_image
-        target = self.target_label.cv_image
+        source = self.source_label.original_cv_image.copy()
+        target = self.target_label.original_cv_image.copy()
         blend_ratio = self.slider.value() / 100.0
         algo_idx = self.algo_combo.currentIndex()
 
-        # 画像を4チャンネルに変換
         if source.shape[2] == 3:
             source = cv2.cvtColor(source, cv2.COLOR_BGR2BGRA)
         if target.shape[2] == 3:
@@ -183,9 +184,8 @@ class ColorMatcherApp(QWidget):
         src_lab = cv2.cvtColor(src_rgb, cv2.COLOR_BGR2LAB).astype("float32")
         tgt_lab = cv2.cvtColor(tgt_rgb, cv2.COLOR_BGR2LAB).astype("float32")
 
-        # === ここからアルゴリズムの分岐 ===
-        if algo_idx in [0, 1, 2]: # Reinhard系
-            if algo_idx == 1: # 2. 白黒除外
+        if algo_idx in [0, 1, 2]: 
+            if algo_idx == 1: 
                 lum_min, lum_max = 20, 235
                 src_lum_mask = ((src_lab[:,:,0] >= lum_min) & (src_lab[:,:,0] <= lum_max)).astype("uint8")
                 tgt_lum_mask = ((tgt_lab[:,:,0] >= lum_min) & (tgt_lab[:,:,0] <= lum_max)).astype("uint8")
@@ -199,13 +199,14 @@ class ColorMatcherApp(QWidget):
                 s_mask = src_mask
                 t_mask = tgt_mask
 
-            if algo_idx == 2: # 3. K-Means
+            if algo_idx == 2: 
                 def get_kmeans_stats(lab_img, mask, k=5):
                     pixels = lab_img[mask > 0]
                     if len(pixels) < k:
                         return np.mean(lab_img, axis=(0,1)), np.std(lab_img, axis=(0,1))
                     
-                    np.random.seed(42) # スライダーを動かした時に色がブレないよう固定
+                    np.random.seed(42) 
+                    # 重くならないようサンプリング数を制限
                     if len(pixels) > 10000:
                         indices = np.random.choice(len(pixels), 10000, replace=False)
                         pixels = pixels[indices]
@@ -222,7 +223,7 @@ class ColorMatcherApp(QWidget):
                 a = (src_lab[:, :, 1] - src_mean[1]) * (tgt_std[1] / (src_std[1] + 1e-5)) + tgt_mean[1]
                 b = (src_lab[:, :, 2] - src_mean[2]) * (tgt_std[2] / (src_std[2] + 1e-5)) + tgt_mean[2]
 
-            else: # 1, 2. 標準 & 白黒除外
+            else: 
                 (lMeanSrc, lStdSrc) = cv2.meanStdDev(src_lab[:, :, 0], mask=s_mask)
                 (aMeanSrc, aStdSrc) = cv2.meanStdDev(src_lab[:, :, 1], mask=s_mask)
                 (bMeanSrc, bStdSrc) = cv2.meanStdDev(src_lab[:, :, 2], mask=s_mask)
@@ -235,7 +236,7 @@ class ColorMatcherApp(QWidget):
                 a = (src_lab[:, :, 1] - aMeanSrc[0][0]) * (aStdTgt[0][0] / (aStdSrc[0][0] + 1e-5)) + aMeanTgt[0][0]
                 b = (src_lab[:, :, 2] - bMeanSrc[0][0]) * (bStdTgt[0][0] / (bStdSrc[0][0] + 1e-5)) + bMeanTgt[0][0]
 
-        elif algo_idx == 3: # 4. ヒストグラムマッチング
+        elif algo_idx == 3: 
             def match_hist(src_ch, tgt_ch, s_mask, t_mask):
                 src_hist, _ = np.histogram(src_ch[s_mask > 0], bins=256, range=[0, 256])
                 tgt_hist, _ = np.histogram(tgt_ch[t_mask > 0], bins=256, range=[0, 256])
@@ -259,7 +260,6 @@ class ColorMatcherApp(QWidget):
             a = match_hist(src_lab[:, :, 1], tgt_lab[:, :, 1], src_mask, tgt_mask)
             b = match_hist(src_lab[:, :, 2], tgt_lab[:, :, 2], src_mask, tgt_mask)
 
-        # === 共通の後処理 ===
         l = np.clip(l, 0, 255)
         a = np.clip(a, 0, 255)
         b = np.clip(b, 0, 255)
@@ -267,7 +267,6 @@ class ColorMatcherApp(QWidget):
         transfer_lab = cv2.merge([l, a, b]).astype("uint8")
         transfer_rgb = cv2.cvtColor(transfer_lab, cv2.COLOR_LAB2BGR)
 
-        # 輪郭とアルファを綺麗にブレンド
         src_mask_float = src_alpha.astype("float32") / 255.0
         src_mask_float = np.expand_dims(src_mask_float, axis=2)
         src_mask_float = np.repeat(src_mask_float, 3, axis=2)
@@ -286,15 +285,24 @@ class ColorMatcherApp(QWidget):
         self.update_preview()
 
     def update_preview(self):
+        # ★ ここで「高画質な結果」をプレビュー枠に合わせて縮小表示する
         if self.result_image is not None:
-            h, w, ch = self.result_image.shape
-            rgb_img = cv2.cvtColor(self.result_image, cv2.COLOR_BGRA2RGBA)
+            preview_img = self.result_image.copy()
+            h, w = preview_img.shape[:2]
+            scale = min(600/w, 600/h)
+            if scale < 1:
+                new_w, new_h = int(w * scale), int(h * scale)
+                preview_img = cv2.resize(preview_img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+
+            h, w, ch = preview_img.shape
+            rgb_img = cv2.cvtColor(preview_img, cv2.COLOR_BGRA2RGBA)
             bytes_per_line = ch * w
             qt_img = QImage(rgb_img.data, w, h, bytes_per_line, QImage.Format_RGBA8888)
             pixmap = QPixmap.fromImage(qt_img)
             self.preview_label.setPixmap(pixmap)
 
     def save_image(self):
+        # ★ 高画質そのままの result_image を保存する
         if self.result_image is None:
             QMessageBox.warning(self, "エラー", "保存する画像がありません！")
             return
