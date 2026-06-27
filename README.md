@@ -1,4 +1,4 @@
-# Color Matcher
+# 色合わせツール
 
 ![スクリーンショット](images/ss.jpg)
 

@@ -97,7 +97,7 @@ class ColorMatcherApp(QWidget):
         self.initUI()
 
     def initUI(self):
-        self.setWindowTitle('Grok Color Matcher - Ultimate Edition')
+        self.setWindowTitle('色合わせツール')
         self.setStyleSheet("background-color: #0d0d0d; color: #ffffff;")
         
         main_layout = QVBoxLayout()
