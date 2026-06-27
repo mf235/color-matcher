@@ -3,9 +3,10 @@ import os
 import cv2
 import numpy as np
 import datetime
+import json
 from PyQt5.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout, 
                              QLabel, QPushButton, QSlider, QComboBox, QMessageBox)
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, QPoint
 from PyQt5.QtGui import QPixmap, QImage
 
 def imread_japanese(filename):
@@ -94,6 +95,7 @@ class ColorMatcherApp(QWidget):
     def __init__(self):
         super().__init__()
         self.result_image = None # ★ ここには常に高画質な処理結果が入る
+        self.settings_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "color-matcher-settings.json")
         self.initUI()
 
     def initUI(self):
@@ -151,6 +153,85 @@ class ColorMatcherApp(QWidget):
 
         main_layout.addLayout(control_layout)
         self.setLayout(main_layout)
+        self.load_app_settings()
+
+    def read_app_settings(self):
+        """スクリプトと同じフォルダのJSONから設定を読み込む"""
+        if not os.path.exists(self.settings_path):
+            return {}
+        try:
+            with open(self.settings_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                return data
+        except Exception as e:
+            print(f"Settings Load Error: {e}")
+        return {}
+
+    def load_app_settings(self):
+        """前回終了時のパラメータとウィンドウ位置・サイズを復元する"""
+        settings = self.read_app_settings()
+        if not settings:
+            return
+
+        try:
+            algo_index = int(settings.get("algo_index", self.algo_combo.currentIndex()))
+            if 0 <= algo_index < self.algo_combo.count():
+                self.algo_combo.setCurrentIndex(algo_index)
+        except Exception:
+            pass
+
+        try:
+            blend_value = int(settings.get("blend_value", self.slider.value()))
+            self.slider.setValue(max(self.slider.minimum(), min(self.slider.maximum(), blend_value)))
+        except Exception:
+            pass
+
+        window = settings.get("window", {})
+        if isinstance(window, dict):
+            try:
+                width = int(window.get("width", self.width()))
+                height = int(window.get("height", self.height()))
+                if width > 0 and height > 0:
+                    self.resize(width, height)
+            except Exception:
+                pass
+
+            try:
+                x = int(window.get("x", self.x()))
+                y = int(window.get("y", self.y()))
+                pos = QPoint(x, y)
+                desktop = QApplication.desktop()
+                is_visible_pos = any(
+                    desktop.availableGeometry(i).adjusted(-80, -80, 80, 80).contains(pos)
+                    for i in range(desktop.screenCount())
+                )
+                if is_visible_pos:
+                    self.move(x, y)
+            except Exception:
+                pass
+
+    def save_app_settings(self):
+        """現在のパラメータとウィンドウ位置・サイズをJSONへ保存する"""
+        settings = {
+            "algo_index": self.algo_combo.currentIndex(),
+            "blend_value": self.slider.value(),
+            "window": {
+                "x": self.x(),
+                "y": self.y(),
+                "width": self.width(),
+                "height": self.height(),
+            },
+        }
+        try:
+            with open(self.settings_path, "w", encoding="utf-8") as f:
+                json.dump(settings, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print(f"Settings Save Error: {e}")
+
+    def closeEvent(self, event):
+        self.save_app_settings()
+        super().closeEvent(event)
 
     def process_image(self):
         # ★ 計算はすべて「退避してあるオリジナル画像」に対して行う
