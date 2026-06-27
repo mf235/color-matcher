@@ -5,9 +5,10 @@ import numpy as np
 import datetime
 import json
 from PyQt5.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout, 
-                             QLabel, QPushButton, QSlider, QComboBox, QMessageBox)
-from PyQt5.QtCore import Qt, QPoint
-from PyQt5.QtGui import QPixmap, QImage
+                             QLabel, QPushButton, QSlider, QComboBox, QMessageBox,
+                             QSizePolicy, QMenu)
+from PyQt5.QtCore import Qt, QPoint, QPointF, QRectF
+from PyQt5.QtGui import QPixmap, QImage, QPainter, QColor, QPen
 
 def imread_japanese(filename):
     """日本語パス対応の画像読み込み"""
@@ -33,63 +34,309 @@ def imwrite_japanese(filename, img):
         print(f"Write Error: {e}")
         return False
 
-class DropLabel(QLabel):
-    """ドラッグ＆ドロップ対応のラベル"""
-    def __init__(self, title, parent=None):
+class ZoomableImageLabel(QLabel):
+    """縦横比維持・ホイールズーム・ドラッグ移動対応の画像表示ラベル"""
+    MIN_ZOOM = 0.01
+    MAX_ZOOM = 20.0  # 2000%
+
+    def __init__(self, title, parent=None, accept_drops=False, dashed_border=False, border_color="#00ffff"):
         super().__init__(title, parent)
+        self.title = title
         self.setAlignment(Qt.AlignCenter)
-        self.setStyleSheet("border: 2px dashed #00ffff; background-color: #1a1a1a; color: #ffffff;")
-        self.setAcceptDrops(True)
+        self.setAcceptDrops(accept_drops)
+        self.setMouseTracking(True)
+        self.setFocusPolicy(Qt.StrongFocus)
+        self.setMinimumSize(260, 260)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.setCursor(Qt.OpenHandCursor)
+
+        self.accept_drops = accept_drops
+        self.dashed_border = dashed_border
+        self.border_color = border_color
+        self.bg_color = "#1a1a1a"
+        self.text_color = "#ffffff"
+
         self.image_path = None
-        self.original_cv_image = None # ★ 高画質の元データを退避
-        self.cv_image = None          # ★ UIプレビュー用の縮小データ
-        self.setMinimumSize(300, 300)
+        self.original_cv_image = None
+        self.fit_mode = True
+        self.zoom_scale = 1.0
+        self.center = None
+        self.dragging = False
+        self.last_drag_pos = None
 
     def dragEnterEvent(self, event):
-        if event.mimeData().hasUrls():
-            event.accept()
+        if self.accept_drops and event.mimeData().hasUrls():
+            event.acceptProposedAction()
         else:
             event.ignore()
 
     def dropEvent(self, event):
+        if not self.accept_drops:
+            event.ignore()
+            return
         urls = event.mimeData().urls()
         if urls:
             path = urls[0].toLocalFile()
             self.load_image(path)
+            event.acceptProposedAction()
 
     def load_image(self, path):
         img = imread_japanese(path)
         if img is not None:
             self.image_path = path
-            
-            # ★ オリジナルの高画質画像をそのままメモリに退避
-            self.original_cv_image = img.copy() 
-            
-            # ★ サムネイル表示用だけにリサイズを行う
-            h, w = img.shape[:2]
-            scale = min(600/w, 600/h)
-            if scale < 1:
-                new_w, new_h = int(w * scale), int(h * scale)
-                self.cv_image = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
-            else:
-                self.cv_image = img.copy()
-            
-            self.update_display()
+            self.set_cv_image(img, reset_view=True)
             self.parent().process_image()
 
-    def update_display(self):
-        if self.cv_image is not None:
-            h, w, ch = self.cv_image.shape
-            if ch == 4:
-                rgb_img = cv2.cvtColor(self.cv_image, cv2.COLOR_BGRA2RGBA)
-                bytes_per_line = ch * w
-                qt_img = QImage(rgb_img.data, w, h, bytes_per_line, QImage.Format_RGBA8888)
-            else:
-                rgb_img = cv2.cvtColor(self.cv_image, cv2.COLOR_BGR2RGB)
-                bytes_per_line = ch * w
-                qt_img = QImage(rgb_img.data, w, h, bytes_per_line, QImage.Format_RGB888)
-            pixmap = QPixmap.fromImage(qt_img)
-            self.setPixmap(pixmap)
+    def set_cv_image(self, img, reset_view=False):
+        if img is None:
+            self.original_cv_image = None
+            self.center = None
+            self.update()
+            return
+
+        old_shape = self.original_cv_image.shape[:2] if self.original_cv_image is not None else None
+        new_shape = img.shape[:2]
+        self.original_cv_image = img.copy()
+
+        if reset_view or old_shape != new_shape or self.center is None:
+            self.reset_view()
+        else:
+            self.clamp_center()
+            self.update()
+
+    def reset_view(self):
+        self.fit_mode = True
+        self.zoom_scale = 1.0
+        if self.original_cv_image is not None:
+            h, w = self.original_cv_image.shape[:2]
+            self.center = QPointF(w / 2.0, h / 2.0)
+        else:
+            self.center = None
+        self.update()
+
+    def center_on_image(self):
+        if self.original_cv_image is None:
+            return
+        h, w = self.original_cv_image.shape[:2]
+        self.center = QPointF(w / 2.0, h / 2.0)
+        self.clamp_center()
+        self.update()
+
+    def get_fit_scale(self):
+        if self.original_cv_image is None:
+            return 1.0
+        h, w = self.original_cv_image.shape[:2]
+        area_w = max(1, self.width() - 8)
+        area_h = max(1, self.height() - 8)
+        return max(self.MIN_ZOOM, min(area_w / max(1, w), area_h / max(1, h)))
+
+    def get_current_scale(self):
+        if self.fit_mode:
+            return self.get_fit_scale()
+        return max(self.MIN_ZOOM, min(self.MAX_ZOOM, self.zoom_scale))
+
+    def set_zoom(self, scale, anchor_pos=None):
+        if self.original_cv_image is None:
+            return
+
+        old_scale = self.get_current_scale()
+        if anchor_pos is not None:
+            anchor_img = self.screen_to_image(anchor_pos, old_scale)
+        else:
+            anchor_img = None
+
+        self.fit_mode = False
+        self.zoom_scale = max(self.MIN_ZOOM, min(self.MAX_ZOOM, float(scale)))
+        new_scale = self.get_current_scale()
+
+        if anchor_img is not None:
+            self.center = QPointF(
+                anchor_img.x() - (anchor_pos.x() - self.width() / 2.0) / new_scale,
+                anchor_img.y() - (anchor_pos.y() - self.height() / 2.0) / new_scale,
+            )
+        self.clamp_center()
+        self.update()
+
+    def zoom_by_factor(self, factor, anchor_pos=None):
+        self.set_zoom(self.get_current_scale() * factor, anchor_pos=anchor_pos)
+
+    def screen_to_image(self, pos, scale=None):
+        if self.original_cv_image is None:
+            return QPointF(0.0, 0.0)
+        if scale is None:
+            scale = self.get_current_scale()
+        if self.center is None:
+            h, w = self.original_cv_image.shape[:2]
+            self.center = QPointF(w / 2.0, h / 2.0)
+        return QPointF(
+            self.center.x() + (pos.x() - self.width() / 2.0) / scale,
+            self.center.y() + (pos.y() - self.height() / 2.0) / scale,
+        )
+
+    def clamp_center(self):
+        if self.original_cv_image is None:
+            return
+        h, w = self.original_cv_image.shape[:2]
+        scale = self.get_current_scale()
+        view_w = self.width() / max(scale, 1e-6)
+        view_h = self.height() / max(scale, 1e-6)
+
+        if self.center is None:
+            self.center = QPointF(w / 2.0, h / 2.0)
+
+        if view_w >= w:
+            cx = w / 2.0
+        else:
+            half = view_w / 2.0
+            cx = min(max(self.center.x(), half), w - half)
+
+        if view_h >= h:
+            cy = h / 2.0
+        else:
+            half = view_h / 2.0
+            cy = min(max(self.center.y(), half), h - half)
+
+        self.center = QPointF(cx, cy)
+
+    def cv_to_qpixmap(self, cv_img):
+        if cv_img.ndim == 2:
+            rgb_img = cv2.cvtColor(cv_img, cv2.COLOR_GRAY2RGB)
+            h, w = rgb_img.shape[:2]
+            qt_img = QImage(rgb_img.data, w, h, 3 * w, QImage.Format_RGB888)
+        elif cv_img.shape[2] == 4:
+            rgba_img = cv2.cvtColor(cv_img, cv2.COLOR_BGRA2RGBA)
+            h, w = rgba_img.shape[:2]
+            qt_img = QImage(rgba_img.data, w, h, 4 * w, QImage.Format_RGBA8888)
+        else:
+            rgb_img = cv2.cvtColor(cv_img, cv2.COLOR_BGR2RGB)
+            h, w = rgb_img.shape[:2]
+            qt_img = QImage(rgb_img.data, w, h, 3 * w, QImage.Format_RGB888)
+        return QPixmap.fromImage(qt_img.copy())
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
+        painter.fillRect(self.rect(), QColor(self.bg_color))
+
+        if self.original_cv_image is None:
+            painter.setPen(QColor(self.text_color))
+            painter.drawText(self.rect(), Qt.AlignCenter, self.title)
+        else:
+            self.clamp_center()
+            img = self.original_cv_image
+            img_h, img_w = img.shape[:2]
+            scale = self.get_current_scale()
+
+            view_w_img = self.width() / max(scale, 1e-6)
+            view_h_img = self.height() / max(scale, 1e-6)
+            x0_f = self.center.x() - view_w_img / 2.0
+            y0_f = self.center.y() - view_h_img / 2.0
+            x1_f = self.center.x() + view_w_img / 2.0
+            y1_f = self.center.y() + view_h_img / 2.0
+
+            x0 = max(0, int(np.floor(x0_f)))
+            y0 = max(0, int(np.floor(y0_f)))
+            x1 = min(img_w, int(np.ceil(x1_f)))
+            y1 = min(img_h, int(np.ceil(y1_f)))
+
+            if x1 > x0 and y1 > y0:
+                crop = img[y0:y1, x0:x1]
+                pixmap = self.cv_to_qpixmap(crop)
+
+                target_x = self.width() / 2.0 - (self.center.x() - x0) * scale
+                target_y = self.height() / 2.0 - (self.center.y() - y0) * scale
+                target_w = (x1 - x0) * scale
+                target_h = (y1 - y0) * scale
+                painter.drawPixmap(QRectF(target_x, target_y, target_w, target_h), pixmap, QRectF(pixmap.rect()))
+
+            zoom_text = "FIT" if self.fit_mode else f"{int(round(scale * 100))}%"
+            overlay = f"{zoom_text}"
+            text_rect = painter.fontMetrics().boundingRect(overlay).adjusted(-6, -4, 6, 4)
+            text_rect.moveBottomRight(self.rect().adjusted(0, 0, -8, -8).bottomRight())
+            painter.fillRect(text_rect, QColor(0, 0, 0, 150))
+            painter.setPen(QColor("#ffffff"))
+            painter.drawText(text_rect, Qt.AlignCenter, overlay)
+
+        pen = QPen(QColor(self.border_color), 2)
+        if self.dashed_border:
+            pen.setStyle(Qt.DashLine)
+        painter.setPen(pen)
+        painter.drawRect(self.rect().adjusted(1, 1, -2, -2))
+
+    def resizeEvent(self, event):
+        self.clamp_center()
+        super().resizeEvent(event)
+        self.update()
+
+    def wheelEvent(self, event):
+        if self.original_cv_image is None:
+            event.ignore()
+            return
+        steps = event.angleDelta().y() / 120.0
+        if steps == 0:
+            event.ignore()
+            return
+        factor = 1.25 ** steps
+        self.zoom_by_factor(factor, anchor_pos=event.pos())
+        event.accept()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton and self.original_cv_image is not None:
+            self.dragging = True
+            self.last_drag_pos = event.pos()
+            self.setCursor(Qt.ClosedHandCursor)
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self.dragging and self.last_drag_pos is not None and self.original_cv_image is not None:
+            scale = self.get_current_scale()
+            delta = event.pos() - self.last_drag_pos
+            self.center = QPointF(
+                self.center.x() - delta.x() / max(scale, 1e-6),
+                self.center.y() - delta.y() / max(scale, 1e-6),
+            )
+            self.last_drag_pos = event.pos()
+            self.clamp_center()
+            self.update()
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton and self.dragging:
+            self.dragging = False
+            self.last_drag_pos = None
+            self.setCursor(Qt.OpenHandCursor)
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def contextMenuEvent(self, event):
+        if self.original_cv_image is None:
+            return
+        menu = QMenu(self)
+        fit_action = menu.addAction("表示リセット（枠に合わせる）")
+        center_action = menu.addAction("表示位置を中央へ")
+        menu.addSeparator()
+        zoom_actions = [
+            (menu.addAction("100%"), 1.0),
+            (menu.addAction("200%"), 2.0),
+            (menu.addAction("400%"), 4.0),
+            (menu.addAction("1000%"), 10.0),
+            (menu.addAction("2000%"), 20.0),
+        ]
+        chosen = menu.exec_(event.globalPos())
+        if chosen == fit_action:
+            self.reset_view()
+        elif chosen == center_action:
+            self.center_on_image()
+        else:
+            for action, scale in zoom_actions:
+                if chosen == action:
+                    self.set_zoom(scale, anchor_pos=event.pos())
+                    break
 
 class ColorMatcherApp(QWidget):
     def __init__(self):
@@ -105,17 +352,19 @@ class ColorMatcherApp(QWidget):
         main_layout = QVBoxLayout()
 
         drop_layout = QHBoxLayout()
-        self.source_label = DropLabel("ここに元画像を\nドロップ\n(透過PNG対応)", self)
-        self.target_label = DropLabel("ここに色参考画像を\nドロップ", self)
+        self.source_label = ZoomableImageLabel("ここに元画像を\nドロップ\n(透過PNG対応)", self, accept_drops=True, dashed_border=True, border_color="#00ffff")
+        self.target_label = ZoomableImageLabel("ここに色参考画像を\nドロップ", self, accept_drops=True, dashed_border=True, border_color="#00ffff")
         drop_layout.addWidget(self.source_label)
         drop_layout.addWidget(self.target_label)
         main_layout.addLayout(drop_layout)
 
-        self.preview_label = QLabel("プレビュー", self)
-        self.preview_label.setAlignment(Qt.AlignCenter)
-        self.preview_label.setStyleSheet("border: 2px solid #a020f0; background-color: #1a1a1a;")
-        self.preview_label.setMinimumSize(600, 600)
-        main_layout.addWidget(self.preview_label)
+        self.preview_label = ZoomableImageLabel("プレビュー", self, accept_drops=False, dashed_border=False, border_color="#a020f0")
+        self.preview_label.setMinimumSize(600, 520)
+        main_layout.addWidget(self.preview_label, stretch=1)
+
+        hint_label = QLabel("ホイール: 拡大縮小 / 左ドラッグ: 表示位置移動 / 右クリック: 表示メニュー", self)
+        hint_label.setStyleSheet("color: #bfbfbf; padding: 2px;")
+        main_layout.addWidget(hint_label)
 
         control_layout = QHBoxLayout()
         
@@ -461,21 +710,9 @@ class ColorMatcherApp(QWidget):
         self.update_preview()
 
     def update_preview(self):
-        # ★ ここで「高画質な結果」をプレビュー枠に合わせて縮小表示する
+        # ★ 表示枠側で縦横比維持・ズーム・パンを処理する
         if self.result_image is not None:
-            preview_img = self.result_image.copy()
-            h, w = preview_img.shape[:2]
-            scale = min(600/w, 600/h)
-            if scale < 1:
-                new_w, new_h = int(w * scale), int(h * scale)
-                preview_img = cv2.resize(preview_img, (new_w, new_h), interpolation=cv2.INTER_AREA)
-
-            h, w, ch = preview_img.shape
-            rgb_img = cv2.cvtColor(preview_img, cv2.COLOR_BGRA2RGBA)
-            bytes_per_line = ch * w
-            qt_img = QImage(rgb_img.data, w, h, bytes_per_line, QImage.Format_RGBA8888)
-            pixmap = QPixmap.fromImage(qt_img)
-            self.preview_label.setPixmap(pixmap)
+            self.preview_label.set_cv_image(self.result_image, reset_view=False)
 
     def save_image(self):
         # ★ 高画質そのままの result_image を保存する
